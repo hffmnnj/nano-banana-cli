@@ -1,6 +1,7 @@
 import { defineCommand, runMain } from "citty";
 import generate from "./commands/generate";
 import auth from "./commands/auth";
+import { registerCleanupHandlers } from "./utils/cleanup";
 
 const main = defineCommand({
   meta: {
@@ -14,4 +15,5 @@ const main = defineCommand({
   },
 });
 
+registerCleanupHandlers();
 runMain(main);
