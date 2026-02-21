@@ -5,13 +5,13 @@
     "": {
       "name": "nano-banana-cli",
       "dependencies": {
-        "@clack/prompts": "^1.0.1",
-        "citty": "^0.2.1",
-        "picocolors": "^1.1.1",
         "puppeteer": "^24.3.0",
       },
       "devDependencies": {
+        "@clack/prompts": "^1.0.1",
         "@types/bun": "latest",
+        "citty": "^0.2.1",
+        "picocolors": "^1.1.1",
       },
     },
   },

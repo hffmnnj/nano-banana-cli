@@ -1,22 +1,29 @@
 {
-  "name": "nano-banana-cli",
-  "version": "0.1.0",
-  "description": "Generate images from Google Gemini via Playwright browser automation",
+  "name": "nanban",
+  "version": "1.0.0",
+  "description": "Generate images with Google Gemini from your terminal",
   "bin": {
-    "nanban": "./src/index.ts"
+    "nanban": "dist/index.js"
   },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
   "scripts": {
     "dev": "bun run src/index.ts",
     "start": "bun run src/index.ts",
-    "typecheck": "bunx tsc --noEmit"
-  },
-  "devDependencies": {
-    "@types/bun": "latest"
+    "typecheck": "bunx tsc --noEmit",
+    "build": "bun build src/index.ts --outfile dist/index.js --target node --external puppeteer --banner '#!/usr/bin/env node' && chmod +x dist/index.js",
+    "prepublishOnly": "bun run typecheck && bun run build"
   },
   "dependencies": {
-    "@clack/prompts": "^1.0.1",
-    "citty": "^0.2.1",
-    "picocolors": "^1.1.1",
     "puppeteer": "^24.3.0"
+  },
+  "devDependencies": {
+    "@clack/prompts": "^1.0.1",
+    "@types/bun": "latest",
+    "citty": "^0.2.1",
+    "picocolors": "^1.1.1"
   }
 }
