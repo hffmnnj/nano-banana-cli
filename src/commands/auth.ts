@@ -1,5 +1,5 @@
 import { defineCommand } from "citty";
-import { pollForAuth } from "../browser/auth-recovery";
+import { waitForWindowClose } from "../browser/auth-recovery";
 import { getOrCreatePage, launchBrowser } from "../browser/session-manager";
 import { showIntro, showOutro, showInfo } from "../cli/ui";
 import { withSpinner, SPINNER_LABELS } from "../cli/progress";
@@ -16,7 +16,7 @@ export default defineCommand({
   async run(): Promise<void> {
     showIntro();
     showInfo("Opening browser for Google sign-in...");
-    showInfo("Sign in, then return to this terminal.");
+    showInfo("Sign in, then close the browser window when done.");
 
     const session = await withSpinner(SPINNER_LABELS.launchingBrowser, () =>
       launchBrowser({ headless: false }),
@@ -26,12 +26,13 @@ export default defineCommand({
     try {
       const page = await getOrCreatePage(session);
 
+      // We only need the initial document to load enough for manual sign-in.
       await page.goto("https://gemini.google.com/app", {
         waitUntil: "domcontentloaded",
-        timeout: 30_000,
+        timeout: 0,
       });
 
-      await withSpinner(SPINNER_LABELS.auth, () => pollForAuth(page));
+      await withSpinner(SPINNER_LABELS.auth, () => waitForWindowClose(session));
 
       showOutro("Session saved. You're ready to generate.");
     } catch (err) {

@@ -1,4 +1,4 @@
-import type { Page } from "playwright";
+import type { ElementHandle, Page } from "puppeteer";
 
 const GEMINI_APP_URL = "https://gemini.google.com/app";
 const AUTH_URL_PATTERNS = [
@@ -14,19 +14,22 @@ const AUTH_DOM_SELECTORS = [
   '[aria-label*="authentication" i]',
   '[aria-label*="Google Account" i]',
   '[data-identifier]',
-  'button:has-text("Sign in")',
-  'button:has-text("Sign in with Google")',
 ] as const;
+
+async function isVisible(handle: ElementHandle<Element>): Promise<boolean> {
+  const box = await handle.boundingBox();
+  return box !== null && box.width > 0 && box.height > 0;
+}
 
 async function hasVisibleAuthElement(page: Page): Promise<boolean> {
   for (const selector of AUTH_DOM_SELECTORS) {
     try {
-      const visible = await page.locator(selector).first().isVisible({ timeout: 1_000 });
-      if (visible) {
+      const handle = await page.$(selector);
+      if (handle && await isVisible(handle)) {
         return true;
       }
     } catch {
-      // Ignore selector/timeout errors and continue checking.
+      // Continue checking fallback selectors.
     }
   }
 
@@ -49,7 +52,6 @@ export async function isAuthRequired(page: Page): Promise<boolean> {
 
     return await hasVisibleAuthElement(page);
   } catch {
-    // Page may have been closed or navigated away — treat as no auth required.
     return false;
   }
 }
@@ -57,9 +59,14 @@ export async function isAuthRequired(page: Page): Promise<boolean> {
 export async function isOnGeminiApp(page: Page): Promise<boolean> {
   try {
     const url = page.url();
-    return url.startsWith(GEMINI_APP_URL);
+    if (!url.startsWith(GEMINI_APP_URL)) return false;
+
+    const signIn = await page.$('input[type="email"], [aria-label*="Sign in" i]');
+    if (signIn && await isVisible(signIn)) return false;
+
+    const appShell = await page.$('[aria-label="New chat"], textarea, [contenteditable="true"]');
+    return appShell ? await isVisible(appShell) : false;
   } catch {
-    // Page may have been closed or navigated away — treat as not on Gemini.
     return false;
   }
 }

@@ -1,4 +1,4 @@
-import { chromium, type BrowserContext, type Page } from "playwright";
+import puppeteer, { type Browser, type Page } from "puppeteer";
 import { ensureDir, getProfilePath } from "../utils/paths";
 import { detectChannel } from "./chrome-detector";
 
@@ -9,7 +9,7 @@ export interface BrowserOptions {
 }
 
 export interface BrowserSession {
-  context: BrowserContext;
+  browser: Browser;
   close: () => Promise<void>;
 }
 
@@ -17,15 +17,18 @@ const DEFAULT_VIEWPORT = { width: 1280, height: 800 };
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
+async function applyPageDefaults(page: Page): Promise<void> {
+  await page.setViewport(DEFAULT_VIEWPORT);
+  await page.setUserAgent(DEFAULT_USER_AGENT);
+}
+
 /**
- * Launch a Playwright browser with a persistent profile.
- * Uses launchPersistentContext to persist cookies and local storage.
+ * Launch a Puppeteer browser with a persistent profile.
  */
 export async function launchBrowser(options: BrowserOptions): Promise<BrowserSession> {
   const profilePath = getProfilePath();
   await ensureDir(profilePath);
 
-  // Use explicit channel if provided, otherwise auto-detect Chrome availability
   const channel = options.channel !== undefined
     ? options.channel
     : await detectChannel();
@@ -34,28 +37,59 @@ export async function launchBrowser(options: BrowserOptions): Promise<BrowserSes
     console.log(`[nanban] Browser channel: ${channel ?? "chromium (bundled)"}`);
   }
 
-  const context = await chromium.launchPersistentContext(profilePath, {
+  const browser = await puppeteer.launch({
     headless: options.headless,
-    channel,
-    viewport: DEFAULT_VIEWPORT,
-    userAgent: DEFAULT_USER_AGENT,
+    channel: channel as "chrome" | undefined,
+    userDataDir: profilePath,
+    defaultViewport: DEFAULT_VIEWPORT,
     args: ["--no-sandbox", "--disable-blink-features=AutomationControlled"],
     ignoreDefaultArgs: ["--enable-automation"],
   });
 
+  for (const existingPage of await browser.pages()) {
+    await applyPageDefaults(existingPage);
+  }
+
   return {
-    context,
+    browser,
     close: async (): Promise<void> => {
-      await context.close();
+      try {
+        await browser.close();
+      } catch {
+        // Browser may already be closed.
+      }
     },
   };
 }
 
 /**
- * Get or create a page in the browser context.
- * Returns the first existing page, or creates a new one.
+ * Get or create a page in the browser.
  */
 export async function getOrCreatePage(session: BrowserSession): Promise<Page> {
-  const pages = session.context.pages();
-  return pages.length > 0 ? pages[0]! : await session.context.newPage();
+  const pages = await session.browser.pages();
+  const page = pages.length > 0 ? pages[0]! : await session.browser.newPage();
+  await applyPageDefaults(page);
+  return page;
+}
+
+/**
+ * Close the current browser session and relaunch with new options.
+ */
+export async function relaunchBrowser(
+  currentSession: BrowserSession,
+  options: BrowserOptions,
+  navigateTo?: string,
+): Promise<BrowserSession> {
+  await currentSession.close();
+
+  await new Promise<void>((resolve) => setTimeout(resolve, 500));
+
+  const newSession = await launchBrowser(options);
+
+  if (navigateTo) {
+    const page = await getOrCreatePage(newSession);
+    await page.goto(navigateTo, { waitUntil: "domcontentloaded", timeout: 0 });
+  }
+
+  return newSession;
 }

@@ -1,17 +1,15 @@
-import { chromium } from "playwright";
+import puppeteer from "puppeteer";
 
 /**
- * Detect if the system Chrome browser is available.
- * Attempts a brief headless launch with channel "chrome" to verify availability.
- * Returns "chrome" if Chrome is installed, undefined to use bundled Chromium.
+ * Detect if system Chrome is available.
+ * Returns "chrome" when Puppeteer can launch that channel.
  */
 export async function detectChannel(): Promise<"chrome" | undefined> {
   try {
-    const browser = await chromium.launch({ channel: "chrome", headless: true });
+    const browser = await puppeteer.launch({ channel: "chrome", headless: true });
     await browser.close();
     return "chrome";
   } catch {
-    // System Chrome not available — fall back to bundled Chromium.
     return undefined;
   }
 }

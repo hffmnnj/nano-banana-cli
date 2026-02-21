@@ -1,443 +1,310 @@
-import { dirname } from "path";
-import type { Locator, Page } from "playwright";
+import { readdir, rename, stat } from "fs/promises";
+import { dirname, join } from "path";
+import type { ElementHandle, Page } from "puppeteer";
 import { isAuthRequired } from "./auth-detector";
 import { ensureDir } from "../utils/paths";
-import { GenerationTimeoutError, SelectorError } from "../utils/errors";
+import { DownloadError, GenerationTimeoutError, SelectorError } from "../utils/errors";
 
 const GEMINI_URL = "https://gemini.google.com/app";
-
-// Navigation timeout (ms)
 const NAV_TIMEOUT = 30_000;
-// UI action timeout (ms)
-const ACTION_TIMEOUT = 10_000;
 const SHORT_WAIT_TIMEOUT = 2_000;
-const GENERATION_TIMEOUT = 120_000;
+const GENERATION_TIMEOUT = 300_000;
 
-interface LocatorStrategy {
-  description: string;
-  createLocator: (page: Page) => Locator;
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    }),
+  ]);
+}
+
+async function isVisible(handle: ElementHandle<Element>): Promise<boolean> {
+  const box = await handle.boundingBox();
+  return box !== null && box.width > 0 && box.height > 0;
+}
+
+async function queryVisible(
+  page: Page,
+  selector: string,
+  timeout = SHORT_WAIT_TIMEOUT,
+): Promise<ElementHandle<Element> | null> {
+  try {
+    await page.waitForSelector(selector, { visible: true, timeout });
+    const handle = await page.$(selector);
+    if (!handle) return null;
+    return await isVisible(handle) ? handle : null;
+  } catch {
+    return null;
+  }
 }
 
 async function clickFirstVisible(
   page: Page,
-  strategies: LocatorStrategy[],
+  selectors: string[],
   clickTimeout: number,
 ): Promise<boolean> {
-  for (const strategy of strategies) {
-    const candidate = strategy.createLocator(page).first();
+  for (const selector of selectors) {
+    const candidate = await queryVisible(page, selector);
+    if (!candidate) continue;
+
+    const disabled = await candidate.evaluate((el) => {
+      const button = el as HTMLButtonElement;
+      return button.disabled || el.getAttribute("aria-disabled") === "true";
+    });
+    if (disabled) continue;
 
     try {
-      await candidate.waitFor({ state: "visible", timeout: SHORT_WAIT_TIMEOUT });
-      await candidate.click({ timeout: clickTimeout });
+      await withTimeout(candidate.click(), clickTimeout, `Click ${selector}`);
       return true;
     } catch {
-      // Continue to next selector strategy when current one is unavailable.
+      // Continue to next selector.
     }
   }
 
   return false;
 }
 
-/**
- * Navigate to the Gemini app and wait for it to load.
- * @param page - Playwright Page instance
- */
 export async function navigateToGemini(page: Page): Promise<void> {
-  await page.goto(GEMINI_URL, {
-    waitUntil: "domcontentloaded",
-    timeout: NAV_TIMEOUT,
-  });
+  await page.goto(GEMINI_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
+  await sleep(2_000);
 
-  // Gemini bootstraps dynamically; brief hydration wait prevents early selector misses.
-  await page.waitForTimeout(2_000);
+  if (await isAuthRequired(page)) return;
 
-  if (await isAuthRequired(page)) {
-    return;
+  const ready =
+    await queryVisible(page, '[aria-label="New chat"]', NAV_TIMEOUT) ||
+    await queryVisible(page, '[aria-label="Gemini"]', NAV_TIMEOUT);
+
+  if (!ready) {
+    throw new SelectorError("Gemini app shell");
   }
-
-  // Aria-label based anchors for app shell readiness.
-  await page.locator('[aria-label="New chat"], [aria-label="Gemini"]').first().waitFor({
-    state: "visible",
-    timeout: NAV_TIMEOUT,
-  });
 }
 
-/**
- * Click the image creation entry point in Gemini.
- * @param page - Playwright Page instance
- */
 export async function initiateImageCreation(page: Page): Promise<void> {
-  const imageEntryStrategies: LocatorStrategy[] = [
-    {
-      // Sidebar image mode button; stable aria-label in current Gemini layouts.
-      description: "aria-label Image button",
-      createLocator: (currentPage) => currentPage.locator('[aria-label="Image"]'),
-    },
-    {
-      // Alternate aria-label used on some account/region variants.
-      description: "aria-label Create Image button",
-      createLocator: (currentPage) => currentPage.locator('[aria-label="Create Image"]'),
-    },
-    {
-      // Role-based fallback when exact labels vary but button semantics remain stable.
-      description: "button role with Image text",
-      createLocator: (currentPage) => currentPage.getByRole("button", { name: /image/i }),
-    },
-    {
-      // Link fallback for sidebar variants rendered as anchors.
-      description: "link role with Image text",
-      createLocator: (currentPage) => currentPage.getByRole("link", { name: /image/i }),
-    },
-    {
-      // Last-resort aria partial match for anchor implementations.
-      description: "aria-label contains Image link",
-      createLocator: (currentPage) => currentPage.locator('a[aria-label*="Image"]'),
-    },
+  const active = await queryVisible(page, '[aria-label*="Deselect Create image" i]');
+  if (active) return;
+
+  const selectors = [
+    'button[aria-label*="Create image" i]',
+    '[role="button"][aria-label*="Create image" i]',
+    'a[aria-label*="Create image" i]',
+    '[aria-label*="Create image" i]',
   ];
 
-  const clickedImageEntry = await clickFirstVisible(page, imageEntryStrategies, ACTION_TIMEOUT);
-
-  if (!clickedImageEntry) {
-    throw new SelectorError("Gemini image creation entry point");
-  }
-
-  // Allow Gemini panel transition after mode switch.
-  await page.waitForTimeout(1_000);
+  const clicked = await clickFirstVisible(page, selectors, 10_000);
+  if (!clicked) throw new SelectorError("Gemini image creation entry point");
+  await sleep(1_000);
 }
 
-/**
- * Open model selector and switch to Pro / Imagen 3 when available.
- * @param page - Playwright Page instance
- */
-export async function selectProModel(page: Page): Promise<void> {
-  const openModelMenuStrategies: LocatorStrategy[] = [
-    {
-      // Preferred: model picker controls often expose aria-label containing "model".
-      description: "aria-label contains model",
-      createLocator: (currentPage) => currentPage.locator('[aria-label*="model" i]'),
-    },
-    {
-      // Role-based fallback for model controls named with current model value.
-      description: "button role with model in accessible name",
-      createLocator: (currentPage) => currentPage.getByRole("button", { name: /model|imagen|pro/i }),
-    },
-  ];
-
-  const openedModelMenu = await clickFirstVisible(page, openModelMenuStrategies, ACTION_TIMEOUT);
-
-  if (!openedModelMenu) {
-    return;
-  }
-
-  await page.waitForTimeout(500);
-
-  const proOptionStrategies: LocatorStrategy[] = [
-    {
-      // Preferred: direct Pro option exposed via aria-label.
-      description: "aria-label contains Pro",
-      createLocator: (currentPage) => currentPage.locator('[aria-label*="Pro" i]'),
-    },
-    {
-      // Preferred: model option explicitly named Imagen 3.
-      description: "aria-label contains Imagen 3",
-      createLocator: (currentPage) => currentPage.locator('[aria-label*="Imagen 3"]'),
-    },
-    {
-      // Role fallback for menu item variants in Material menus.
-      description: "menuitem role with Imagen 3 or Pro text",
-      createLocator: (currentPage) =>
-        currentPage.getByRole("menuitem", { name: /imagen\s*3|pro/i }),
-    },
-    {
-      // Button fallback for model cards rendered as buttons.
-      description: "button role with Imagen 3 or Pro text",
-      createLocator: (currentPage) => currentPage.getByRole("button", { name: /imagen\s*3|pro/i }),
-    },
-  ];
-
-  await clickFirstVisible(page, proOptionStrategies, ACTION_TIMEOUT);
-  await page.waitForTimeout(500);
-}
-
-/**
- * Type the generation prompt into Gemini's prompt input.
- * @param page - Playwright Page instance
- * @param prompt - User prompt text
- */
 export async function typePrompt(page: Page, prompt: string): Promise<void> {
-  const inputStrategies: LocatorStrategy[] = [
-    {
-      description: "aria-label contains prompt",
-      createLocator: (currentPage) => currentPage.locator('[aria-label*="prompt" i]'),
-    },
-    {
-      description: "Enter a prompt aria-label",
-      createLocator: (currentPage) => currentPage.locator('[aria-label="Enter a prompt"]'),
-    },
-    {
-      description: "aria-label contains Describe",
-      createLocator: (currentPage) => currentPage.locator('[aria-label*="Describe" i]'),
-    },
-    {
-      description: "placeholder contains prompt",
-      createLocator: (currentPage) => currentPage.locator('[placeholder*="prompt" i]'),
-    },
-    {
-      description: "labeled textarea",
-      createLocator: (currentPage) => currentPage.locator("textarea[aria-label]"),
-    },
-    {
-      description: "textbox role",
-      createLocator: (currentPage) => currentPage.getByRole("textbox"),
-    },
+  const selectors = [
+    'div[role="textbox"][aria-label="Enter a prompt for Gemini"]',
+    'div[role="textbox"]',
+    '.ql-editor[role="textbox"]',
+    '.ql-editor',
   ];
 
-  let inputLocator: Locator | null = null;
-
-  for (const strategy of inputStrategies) {
-    const candidate = strategy.createLocator(page).first();
-
-    try {
-      await candidate.waitFor({ state: "visible", timeout: SHORT_WAIT_TIMEOUT });
-      inputLocator = candidate;
-      break;
-    } catch {
-      // Continue to next selector strategy when current one is unavailable.
-    }
+  let input: ElementHandle<Element> | null = null;
+  for (const selector of selectors) {
+    input = await queryVisible(page, selector);
+    if (input) break;
   }
 
-  if (!inputLocator) {
+  if (!input) {
     throw new SelectorError("Gemini prompt input field");
   }
 
-  await inputLocator.click({ timeout: ACTION_TIMEOUT });
-  await page.waitForTimeout(300);
-  await inputLocator.fill("");
-  await page.keyboard.type(prompt, { delay: 30 });
-  await page.waitForTimeout(200);
+  await input.click();
+  await sleep(200);
+
+  try {
+    await input.evaluate((el, value) => {
+      const node = el as HTMLElement;
+      node.focus();
+
+      if (node.isContentEditable) {
+        node.textContent = "";
+        node.dispatchEvent(new Event("input", { bubbles: true }));
+        node.textContent = value;
+        node.dispatchEvent(new Event("input", { bubbles: true }));
+        node.dispatchEvent(new Event("change", { bubbles: true }));
+      } else if ("value" in node) {
+        const inputNode = node as HTMLInputElement | HTMLTextAreaElement;
+        inputNode.value = value;
+        inputNode.dispatchEvent(new Event("input", { bubbles: true }));
+        inputNode.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    }, prompt);
+  } catch {
+    await page.keyboard.down("Control");
+    await page.keyboard.press("A");
+    await page.keyboard.up("Control");
+    await page.keyboard.type(prompt);
+  }
+
+  await sleep(200);
 }
 
-/**
- * Submit the prompt to start image generation.
- * @param page - Playwright Page instance
- */
 export async function triggerGeneration(page: Page): Promise<void> {
-  const submitStrategies: LocatorStrategy[] = [
-    {
-      description: "Send button by aria-label",
-      createLocator: (currentPage) => currentPage.locator('button[aria-label*="Send" i]'),
-    },
-    {
-      description: "Generate button by aria-label",
-      createLocator: (currentPage) => currentPage.locator('button[aria-label*="Generate" i]'),
-    },
-    {
-      description: "Submit button by aria-label",
-      createLocator: (currentPage) => currentPage.locator('button[aria-label*="Submit" i]'),
-    },
-    {
-      description: "submit type button",
-      createLocator: (currentPage) => currentPage.locator('button[type="submit"]'),
-    },
-    {
-      description: "role-based send/generate button",
-      createLocator: (currentPage) =>
-        currentPage.getByRole("button", { name: /send|generate|submit/i }),
-    },
+  const selectors = [
+    'button[aria-label*="Send" i]',
+    'button[aria-label*="Generate" i]',
+    'button[aria-label*="Submit" i]',
+    'button[type="submit"]',
   ];
 
-  const clickedSubmit = await clickFirstVisible(page, submitStrategies, ACTION_TIMEOUT);
-
-  if (!clickedSubmit) {
+  const clicked = await clickFirstVisible(page, selectors, 10_000);
+  if (!clicked) {
     await page.keyboard.press("Enter");
   }
 
-  await page.waitForTimeout(500);
+  await sleep(500);
 }
 
-/**
- * Wait until Gemini finishes image generation and a generated image is visible.
- * @param page - Playwright Page instance
- * @param timeoutMs - Maximum wait time in milliseconds
- */
-export async function waitForGeneration(
-  page: Page,
-  timeoutMs: number = GENERATION_TIMEOUT,
-): Promise<void> {
-  const loadingStrategies: LocatorStrategy[] = [
-    {
-      description: "aria-label contains generating",
-      createLocator: (currentPage) => currentPage.locator('[aria-label*="Generating" i]'),
-    },
-    {
-      description: "aria-label contains loading",
-      createLocator: (currentPage) => currentPage.locator('[aria-label*="Loading" i]'),
-    },
-    {
-      description: "progressbar role",
-      createLocator: (currentPage) => currentPage.getByRole("progressbar"),
-    },
-    {
-      description: "aria-busy true",
-      createLocator: (currentPage) => currentPage.locator('[aria-busy="true"]'),
-    },
-  ];
-
-  // Best-effort wait for loading state to clear before polling for the final image.
-  for (const strategy of loadingStrategies) {
-    const candidate = strategy.createLocator(page).first();
-
+export async function waitForGeneration(page: Page): Promise<void> {
+  if (!/\/app\/.+/.test(page.url())) {
     try {
-      if (await candidate.isVisible()) {
-        await candidate.waitFor({
-          state: "hidden",
-          timeout: Math.min(15_000, timeoutMs),
-        });
-        break;
-      }
+      await page.waitForFunction(() => /\/app\/.+/.test(window.location.pathname), {
+        timeout: 30_000,
+      });
     } catch {
-      // Loading indicator strategy may not exist in every Gemini variant.
+      // Continue even if URL already settled or delayed.
     }
   }
-
-  const imageStrategies: LocatorStrategy[] = [
-    {
-      description: "aria-label Generated image",
-      createLocator: (currentPage) => currentPage.locator('[aria-label*="Generated image" i]'),
-    },
-    {
-      description: "aria-label Image result",
-      createLocator: (currentPage) => currentPage.locator('[aria-label*="Image result" i]'),
-    },
-    {
-      description: "img with generated alt text",
-      createLocator: (currentPage) => currentPage.locator('img[alt*="generated" i]'),
-    },
-    {
-      // Last-resort fallback: class selector for known response container variants.
-      description: "response container image fallback",
-      createLocator: (currentPage) => currentPage.locator(".response-container img"),
-    },
-    {
-      description: "base64 image source fallback",
-      createLocator: (currentPage) => currentPage.locator('img[src*="data:image"]'),
-    },
-    {
-      description: "any visible image with src fallback",
-      createLocator: (currentPage) => currentPage.locator('img[src]:not([src=""])'),
-    },
-  ];
-
-  const deadline = Date.now() + timeoutMs;
-
-  while (Date.now() < deadline) {
-    for (const strategy of imageStrategies) {
-      const candidate = strategy.createLocator(page).first();
-
-      try {
-        if (await candidate.isVisible()) {
-          return;
-        }
-      } catch {
-        // Continue polling until timeout.
-      }
-    }
-
-    await page.waitForTimeout(500);
-  }
-
-  throw new GenerationTimeoutError(Math.floor(timeoutMs / 1000));
-}
-
-/**
- * Hover the generated image to reveal Gemini's download controls.
- * @param page - Playwright Page instance
- */
-export async function hoverToRevealDownload(page: Page): Promise<void> {
-  const imgStrategies: LocatorStrategy[] = [
-    {
-      description: "aria-label Generated image",
-      createLocator: (currentPage) => currentPage.locator('[aria-label*="Generated image" i]').first(),
-    },
-    {
-      description: "aria-label Image result",
-      createLocator: (currentPage) => currentPage.locator('[aria-label*="Image result" i]').first(),
-    },
-    {
-      description: "img with generated alt text",
-      createLocator: (currentPage) => currentPage.locator('img[alt*="generated" i]').first(),
-    },
-    {
-      description: "last image with src fallback",
-      createLocator: (currentPage) => currentPage.locator('img[src]:not([src=""])').last(),
-    },
-  ];
-
-  let imageEl: Locator | null = null;
-
-  for (const strategy of imgStrategies) {
-    const candidate = strategy.createLocator(page);
-
-    try {
-      await candidate.waitFor({ state: "visible", timeout: SHORT_WAIT_TIMEOUT });
-      imageEl = candidate;
-      break;
-    } catch {
-      // Try next strategy.
-    }
-  }
-
-  if (!imageEl) {
-    throw new SelectorError("generated image element");
-  }
-
-  await imageEl.hover({ timeout: ACTION_TIMEOUT });
-  await page.waitForTimeout(800);
-
-  const downloadButton = page
-    .locator(
-      '[aria-label*="Download full size" i], [aria-label*="Download" i], button:has-text("Download")',
-    )
-    .first();
 
   try {
-    await downloadButton.waitFor({ state: "visible", timeout: 3_000 });
+    await page.waitForSelector('img[alt*="AI generated" i]', {
+      visible: true,
+      timeout: GENERATION_TIMEOUT,
+    });
   } catch {
-    // Download selector variants are handled by the download step's own strategy set.
+    throw new GenerationTimeoutError(GENERATION_TIMEOUT / 1000);
   }
+}
+
+async function findGeneratedImage(page: Page): Promise<ElementHandle<Element> | null> {
+  const selectors = ['img[alt*="AI generated" i]', 'img[alt*="generated" i]'];
+
+  for (const selector of selectors) {
+    const image = await queryVisible(page, selector);
+    if (image) return image;
+  }
+
+  return null;
+}
+
+async function hoverGeneratedImage(page: Page): Promise<void> {
+  const image = await findGeneratedImage(page);
+  if (!image) return;
+
+  const box = await image.boundingBox();
+  if (!box) return;
+
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await sleep(400);
+}
+
+export async function hoverToRevealDownload(page: Page): Promise<void> {
+  await hoverGeneratedImage(page);
+}
+
+async function clickDownloadFullSize(page: Page): Promise<void> {
+  const selectors = [
+    '[data-test-id="download-generated-image-button"]',
+    '[aria-label="Download full-sized image"]',
+    '[aria-label*="Download full-sized" i]',
+  ];
+
+  // Try visible-click first after hover.
+  for (const selector of selectors) {
+    const button = await queryVisible(page, selector, 3_000);
+    if (!button) continue;
+
+    try {
+      await withTimeout(button.click(), 10_000, `Click ${selector}`);
+      return;
+    } catch {
+      // Try other selectors, then JS fallback below.
+    }
+  }
+
+  // Fallback for on-hover controls that Puppeteer may still treat as hidden.
+  const clicked = await page.evaluate((selectorList) => {
+    for (const selector of selectorList) {
+      const node = document.querySelector(selector) as HTMLElement | null;
+      if (!node) continue;
+      node.click();
+      return true;
+    }
+    return false;
+  }, selectors);
+
+  if (!clicked) {
+    throw new SelectorError("Download full-sized image button");
+  }
+}
+
+async function waitForDownloadedFile(
+  dirPath: string,
+  beforeSet: Set<string>,
+  timeoutMs: number,
+): Promise<string> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const files = await readdir(dirPath).catch(() => [] as string[]);
+    const created = files.filter((name) => !beforeSet.has(name));
+
+    const finalized = created.filter((name) => !name.endsWith(".crdownload") && !name.endsWith(".tmp"));
+    if (finalized.length > 0) {
+      const candidates = await Promise.all(
+        finalized.map(async (name) => ({
+          name,
+          mtimeMs: (await stat(join(dirPath, name))).mtimeMs,
+        })),
+      );
+
+      candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+      return candidates[0]!.name;
+    }
+
+    await sleep(250);
+  }
+
+  throw new DownloadError("Timed out waiting for browser download to complete.");
 }
 
 export async function downloadImage(page: Page, outputPath: string): Promise<string> {
-  const downloadPromise = page.waitForEvent("download", { timeout: 30_000 });
+  await hoverGeneratedImage(page);
 
-  const downloadBtnStrategies: LocatorStrategy[] = [
-    {
-      description: "aria-label Download full size",
-      createLocator: (p) => p.locator('[aria-label*="Download full size" i]'),
-    },
-    {
-      description: "aria-label contains Download",
-      createLocator: (p) => p.locator('[aria-label*="Download" i]').first(),
-    },
-    {
-      description: "button with Download text",
-      createLocator: (p) => p.getByRole("button", { name: /download/i }).first(),
-    },
-    {
-      description: "link with Download text",
-      createLocator: (p) => p.getByRole("link", { name: /download/i }).first(),
-    },
-  ];
+  const outputDir = dirname(outputPath);
+  await ensureDir(outputDir);
 
-  const clicked = await clickFirstVisible(page, downloadBtnStrategies, ACTION_TIMEOUT);
+  const beforeFiles = new Set(await readdir(outputDir).catch(() => [] as string[]));
 
-  if (!clicked) {
-    throw new SelectorError("Download full size button");
+  // Route browser download into the target directory.
+  const cdp = await page.target().createCDPSession();
+  try {
+    await cdp.send("Page.setDownloadBehavior", {
+      behavior: "allow",
+      downloadPath: outputDir,
+    });
+  } catch {
+    // Continue; some environments may not support this command.
   }
 
-  const download = await downloadPromise;
-  await ensureDir(dirname(outputPath));
-  await download.saveAs(outputPath);
+  await clickDownloadFullSize(page);
+
+  const downloadedName = await waitForDownloadedFile(outputDir, beforeFiles, 30_000);
+  const downloadedPath = join(outputDir, downloadedName);
+
+  if (downloadedPath !== outputPath) {
+    await rename(downloadedPath, outputPath);
+  }
 
   return outputPath;
 }
@@ -453,12 +320,10 @@ export async function runGenerationFlow(
 ): Promise<GenerationResult> {
   await navigateToGemini(page);
   await initiateImageCreation(page);
-  await selectProModel(page);
   await typePrompt(page, prompt);
   await triggerGeneration(page);
   await waitForGeneration(page);
   await hoverToRevealDownload(page);
   const savedPath = await downloadImage(page, outputPath);
-
   return { outputPath: savedPath };
 }

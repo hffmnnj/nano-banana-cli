@@ -1,3 +1,6 @@
+import { appendFileSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
 import { defineCommand } from "citty";
 import {
   getOrCreatePage,
@@ -6,7 +9,7 @@ import {
 } from "../browser/session-manager";
 import { isAuthRequired } from "../browser/auth-detector";
 import {
-  pollForAuth,
+  waitForWindowClose,
   resumeAfterAuth,
   switchToVisible,
 } from "../browser/auth-recovery";
@@ -15,12 +18,11 @@ import {
   hoverToRevealDownload,
   initiateImageCreation,
   navigateToGemini,
-  selectProModel,
   triggerGeneration,
   typePrompt,
   waitForGeneration,
 } from "../browser/gemini-automation";
-import { getDefaultOutputPath, getMultiOutputPath } from "../utils/paths";
+import { ensureDir, getDefaultOutputPath, getMultiOutputPath } from "../utils/paths";
 import { showIntro, showOutro, showStep, showInfo } from "../cli/ui";
 import { withSpinner, SPINNER_LABELS } from "../cli/progress";
 import { showError, exitWithError } from "../cli/errors";
@@ -55,12 +57,25 @@ export default defineCommand({
       description: "Show detailed automation logs",
       default: false,
     },
+    headed: {
+      type: "boolean",
+      description: "Run browser in headed (visible) mode for debugging",
+      default: false,
+    },
+    debug: {
+      type: "boolean",
+      alias: "d",
+      description: "Write debug logs and keep browser open on headed failures",
+      default: false,
+    },
   },
   async run({ args }): Promise<void> {
     const prompt = args.prompt;
     const count = parseInt(args.count ?? "1", 10);
     const outputPath = args.output ?? null;
     const verbose = args.verbose ?? false;
+    const headed = args.headed ?? false;
+    const debug = args.debug ?? false;
 
     if (!prompt || prompt.trim().length === 0) {
       exitWithError("Prompt is required.");
@@ -73,44 +88,82 @@ export default defineCommand({
     showIntro();
 
     const timestamp = Date.now();
+    const debugDir = join(homedir(), ".nban", "debug");
+    const debugLogPath = join(debugDir, `nanban-debug-${timestamp}.log`);
+    const generationGuardTimeoutMs = 360_000;
     let session: BrowserSession | null = null;
+    let keepBrowserOpenForDebug = false;
+
+    const formatError = (err: unknown): string => {
+      if (!(err instanceof Error)) return String(err);
+      return err.stack ? `${err.name}: ${err.message}\n${err.stack}` : `${err.name}: ${err.message}`;
+    };
+
+    const debugLog = (message: string, err?: unknown): void => {
+      if (!debug) return;
+      const line = `[${new Date().toISOString()}] ${message}${err ? `\n${formatError(err)}` : ""}\n`;
+      appendFileSync(debugLogPath, line, { encoding: "utf8" });
+    };
 
     try {
+      if (debug) {
+        await ensureDir(debugDir);
+        showInfo(`Debug log: ${debugLogPath}`);
+        showInfo(`Debug traces will be written under: ${debugDir}`);
+        debugLog(`debug enabled pid=${process.pid} headed=${headed} verbose=${verbose} count=${count}`);
+      }
+
       session = await withSpinner(SPINNER_LABELS.launchingBrowser, () =>
-        launchBrowser({ headless: true, verbose }),
+        launchBrowser({ headless: !headed, verbose }),
       );
       registerSession(session);
 
       let page = await getOrCreatePage(session);
 
-      await withSpinner(SPINNER_LABELS.navigating, () =>
-        navigateToGemini(page),
-      );
+      if (debug) {
+        session.browser.on("disconnected", () => debugLog("browser event: disconnected"));
+        page.on("close", () => debugLog("page event: close"));
+        page.on("error", (error) => debugLog("page event: error", error));
+        page.on("pageerror", (error) => debugLog("page event: pageerror", error));
+        page.on("framenavigated", (frame) => {
+          if (frame === page.mainFrame()) {
+            debugLog(`page event: navigated -> ${frame.url()}`);
+          }
+        });
+        page.on("requestfailed", (request) => {
+          const detail = request.failure()?.errorText ?? "unknown";
+          debugLog(`page event: requestfailed ${request.method()} ${request.url()} :: ${detail}`);
+        });
+        page.on("response", (response) => {
+          if (response.status() >= 400) {
+            debugLog(`page event: response ${response.status()} ${response.url()}`);
+          }
+        });
+        page.on("console", (msg) => {
+          const type = msg.type();
+          if (type === "error" || type === "warn") {
+            debugLog(`page console.${type}: ${msg.text()}`);
+          }
+        });
+      }
+
+      await withSpinner(SPINNER_LABELS.navigating, () => navigateToGemini(page));
 
       if (await isAuthRequired(page)) {
         const currentUrl = page.url();
         showInfo("Authentication required. Opening browser for sign-in...");
+        showInfo("Sign in, then close the browser window when done.");
         unregisterSession(session);
         session = await switchToVisible(session, currentUrl);
         registerSession(session);
-        page = await getOrCreatePage(session);
-        await withSpinner(SPINNER_LABELS.auth, () => pollForAuth(page));
+        await withSpinner(SPINNER_LABELS.auth, () => waitForWindowClose(session!));
         unregisterSession(session);
-        session = await resumeAfterAuth(
-          session,
-          "https://gemini.google.com/app",
-        );
+        session = await resumeAfterAuth(session, "https://gemini.google.com/app");
         registerSession(session);
         page = await getOrCreatePage(session);
       }
 
-      await withSpinner(SPINNER_LABELS.initiating, () =>
-        initiateImageCreation(page),
-      );
-      await withSpinner(SPINNER_LABELS.selectingModel, () =>
-        selectProModel(page),
-      );
-
+      await withSpinner(SPINNER_LABELS.initiating, () => initiateImageCreation(page));
       const savedPaths: string[] = [];
       const basePath = outputPath ?? getDefaultOutputPath(timestamp);
 
@@ -123,19 +176,36 @@ export default defineCommand({
           count === 1 ? basePath : getMultiOutputPath(basePath, i, count);
 
         try {
-          await withSpinner(SPINNER_LABELS.typing, () =>
-            typePrompt(page, prompt),
-          );
-          await withSpinner(SPINNER_LABELS.generating, async () => {
-            await triggerGeneration(page);
-            await waitForGeneration(page);
-          });
-          await withSpinner(SPINNER_LABELS.downloading, async () => {
-            await hoverToRevealDownload(page);
-            await downloadImage(page, imagePath);
-          });
+          await withSpinner(SPINNER_LABELS.typing, () => typePrompt(page, prompt));
+
+          const generationKeepAlive = setInterval(() => {}, 500);
+          try {
+            await withSpinner(SPINNER_LABELS.generating, async () => {
+              await triggerGeneration(page);
+              await Promise.race([
+                waitForGeneration(page),
+                new Promise<never>((_, reject) => {
+                  setTimeout(() => {
+                    reject(
+                      new Error(
+                        `Generation watchdog timeout after ${generationGuardTimeoutMs / 1000}s.`,
+                      ),
+                    );
+                  }, generationGuardTimeoutMs);
+                }),
+              ]);
+            });
+            await withSpinner(SPINNER_LABELS.downloading, async () => {
+              await hoverToRevealDownload(page);
+              await downloadImage(page, imagePath);
+            });
+          } finally {
+            clearInterval(generationKeepAlive);
+          }
+
           savedPaths.push(imagePath);
         } catch (err) {
+          debugLog(`image ${i} failed`, err);
           showError(
             `Image ${i} failed: ${err instanceof Error ? err.message : String(err)}`,
             count > 1 ? "Continuing with remaining images..." : undefined,
@@ -164,12 +234,33 @@ export default defineCommand({
       const hint = err instanceof NanoBananaError
         ? err.hint
         : "Run `nanban auth` if you need to sign in first.";
+
+      debugLog("command failed", err);
       showError(message, hint);
-      process.exit(1);
+
+      if (debug && headed && session) {
+        keepBrowserOpenForDebug = true;
+        showInfo("Headed debug mode: browser left open for inspection.");
+        showInfo("Close the browser window when finished debugging.");
+      }
+
+      process.exitCode = 1;
     } finally {
       if (session) {
         unregisterSession(session);
-        await session.close();
+
+        if (keepBrowserOpenForDebug && session.browser.connected) {
+          const browser = session.browser;
+          await new Promise<void>((resolve) => {
+            browser.once("disconnected", () => resolve());
+          });
+        } else {
+          await session.close();
+        }
+      }
+
+      if (debug) {
+        showInfo(`Debug log saved: ${debugLogPath}`);
       }
     }
   },
