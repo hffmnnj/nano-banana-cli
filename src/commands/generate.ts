@@ -2,7 +2,9 @@ import { appendFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { defineCommand } from "citty";
+import type { Page } from "puppeteer";
 import {
+  createPage,
   getOrCreatePage,
   launchBrowser,
   type BrowserSession,
@@ -18,6 +20,7 @@ import {
   hoverToRevealDownload,
   initiateImageCreation,
   navigateToGemini,
+  startNewChat,
   triggerGeneration,
   typePrompt,
   waitForGeneration,
@@ -105,6 +108,57 @@ export default defineCommand({
       appendFileSync(debugLogPath, line, { encoding: "utf8" });
     };
 
+    const waitForGenerationWithWatchdog = async (pageForGeneration: Page): Promise<void> => {
+      let watchdog: ReturnType<typeof setTimeout> | null = null;
+
+      try {
+        await Promise.race([
+          waitForGeneration(pageForGeneration),
+          new Promise<never>((_, reject) => {
+            watchdog = setTimeout(() => {
+              reject(
+                new Error(
+                  `Generation watchdog timeout after ${generationGuardTimeoutMs / 1000}s.`,
+                ),
+              );
+            }, generationGuardTimeoutMs);
+          }),
+        ]);
+      } finally {
+        if (watchdog) {
+          clearTimeout(watchdog);
+        }
+      }
+    };
+
+    const attachDebugPageHooks = (debugPage: Page, label: string): void => {
+      if (!debug) return;
+
+      debugPage.on("close", () => debugLog(`page[${label}] event: close`));
+      debugPage.on("error", (error) => debugLog(`page[${label}] event: error`, error));
+      debugPage.on("pageerror", (error) => debugLog(`page[${label}] event: pageerror`, error));
+      debugPage.on("framenavigated", (frame) => {
+        if (frame === debugPage.mainFrame()) {
+          debugLog(`page[${label}] event: navigated -> ${frame.url()}`);
+        }
+      });
+      debugPage.on("requestfailed", (request) => {
+        const detail = request.failure()?.errorText ?? "unknown";
+        debugLog(`page[${label}] requestfailed ${request.method()} ${request.url()} :: ${detail}`);
+      });
+      debugPage.on("response", (response) => {
+        if (response.status() >= 400) {
+          debugLog(`page[${label}] response ${response.status()} ${response.url()}`);
+        }
+      });
+      debugPage.on("console", (msg) => {
+        const type = msg.type();
+        if (type === "error" || type === "warn") {
+          debugLog(`page[${label}] console.${type}: ${msg.text()}`);
+        }
+      });
+    };
+
     try {
       if (debug) {
         await ensureDir(debugDir);
@@ -122,29 +176,7 @@ export default defineCommand({
 
       if (debug) {
         session.browser.on("disconnected", () => debugLog("browser event: disconnected"));
-        page.on("close", () => debugLog("page event: close"));
-        page.on("error", (error) => debugLog("page event: error", error));
-        page.on("pageerror", (error) => debugLog("page event: pageerror", error));
-        page.on("framenavigated", (frame) => {
-          if (frame === page.mainFrame()) {
-            debugLog(`page event: navigated -> ${frame.url()}`);
-          }
-        });
-        page.on("requestfailed", (request) => {
-          const detail = request.failure()?.errorText ?? "unknown";
-          debugLog(`page event: requestfailed ${request.method()} ${request.url()} :: ${detail}`);
-        });
-        page.on("response", (response) => {
-          if (response.status() >= 400) {
-            debugLog(`page event: response ${response.status()} ${response.url()}`);
-          }
-        });
-        page.on("console", (msg) => {
-          const type = msg.type();
-          if (type === "error" || type === "warn") {
-            debugLog(`page console.${type}: ${msg.text()}`);
-          }
-        });
+        attachDebugPageHooks(page, "primary");
       }
 
       await withSpinner(SPINNER_LABELS.navigating, () => navigateToGemini(page));
@@ -161,56 +193,138 @@ export default defineCommand({
         session = await resumeAfterAuth(session, "https://gemini.google.com/app");
         registerSession(session);
         page = await getOrCreatePage(session);
+
+        if (debug) {
+          session.browser.on("disconnected", () => debugLog("browser event: disconnected"));
+          attachDebugPageHooks(page, "primary-post-auth");
+        }
       }
 
-      await withSpinner(SPINNER_LABELS.initiating, () => initiateImageCreation(page));
       const savedPaths: string[] = [];
       const basePath = outputPath ?? getDefaultOutputPath(timestamp);
 
-      for (let i = 1; i <= count; i++) {
-        if (count > 1) {
-          showStep(`Generating image ${i} of ${count}...`);
+      const startSingleImageGeneration = async (
+        workerPage: Page,
+        workerLabel: string,
+      ): Promise<void> => {
+        debugLog(`[${workerLabel}] start generation`);
+        await navigateToGemini(workerPage);
+        await startNewChat(workerPage);
+        await initiateImageCreation(workerPage);
+        await typePrompt(workerPage, prompt);
+        await triggerGeneration(workerPage);
+        debugLog(`[${workerLabel}] generation triggered`);
+      };
+
+      const finishSingleImageDownload = async (
+        workerPage: Page,
+        imagePath: string,
+        workerLabel: string,
+      ): Promise<string> => {
+        const generationKeepAlive = setInterval(() => {}, 500);
+        try {
+          await waitForGenerationWithWatchdog(workerPage);
+          await hoverToRevealDownload(workerPage);
+          await downloadImage(workerPage, imagePath);
+        } finally {
+          clearInterval(generationKeepAlive);
         }
 
-        const imagePath =
-          count === 1 ? basePath : getMultiOutputPath(basePath, i, count);
+        debugLog(`[${workerLabel}] saved -> ${imagePath}`);
+        return imagePath;
+      };
 
-        try {
-          await withSpinner(SPINNER_LABELS.typing, () => typePrompt(page, prompt));
+      if (count === 1) {
+        const imagePath = basePath;
+        await withSpinner(SPINNER_LABELS.initiating, async () => {
+          await startNewChat(page);
+          await initiateImageCreation(page);
+        });
+        await withSpinner(SPINNER_LABELS.typing, () => typePrompt(page, prompt));
+        await withSpinner(SPINNER_LABELS.generating, async () => {
+          await triggerGeneration(page);
+        });
+        await withSpinner(SPINNER_LABELS.downloading, () =>
+          finishSingleImageDownload(page, imagePath, "worker-1")
+        );
+        savedPaths.push(imagePath);
+      } else {
+        showStep(`Starting ${count} image generations across browser tabs...`);
 
-          const generationKeepAlive = setInterval(() => {}, 500);
-          try {
-            await withSpinner(SPINNER_LABELS.generating, async () => {
-              await triggerGeneration(page);
-              await Promise.race([
-                waitForGeneration(page),
-                new Promise<never>((_, reject) => {
-                  setTimeout(() => {
-                    reject(
-                      new Error(
-                        `Generation watchdog timeout after ${generationGuardTimeoutMs / 1000}s.`,
-                      ),
-                    );
-                  }, generationGuardTimeoutMs);
-                }),
-              ]);
-            });
-            await withSpinner(SPINNER_LABELS.downloading, async () => {
-              await hoverToRevealDownload(page);
-              await downloadImage(page, imagePath);
-            });
-          } finally {
-            clearInterval(generationKeepAlive);
+        const workerPages: Page[] = [page];
+        for (let i = 2; i <= count; i++) {
+          const workerPage = await createPage(session);
+          workerPages.push(workerPage);
+          attachDebugPageHooks(workerPage, `worker-${i}`);
+        }
+
+        const imagePaths = workerPages.map((_, index) =>
+          getMultiOutputPath(basePath, index + 1, count)
+        );
+
+        const generationStarted: boolean[] = workerPages.map(() => false);
+
+        for (let i = 0; i < workerPages.length; i++) {
+          const workerPage = workerPages[i]!;
+          const workerLabel = `worker-${i + 1}`;
+
+          if (headed) {
+            await workerPage.bringToFront().catch(() => undefined);
           }
 
-          savedPaths.push(imagePath);
-        } catch (err) {
-          debugLog(`image ${i} failed`, err);
-          showError(
-            `Image ${i} failed: ${err instanceof Error ? err.message : String(err)}`,
-            count > 1 ? "Continuing with remaining images..." : undefined,
+          showStep(`Starting generation for image ${i + 1} of ${count}...`);
+
+          try {
+            await withSpinner(SPINNER_LABELS.typing, () =>
+              startSingleImageGeneration(workerPage, workerLabel)
+            );
+            generationStarted[i] = true;
+          } catch (err) {
+            debugLog(`${workerLabel} failed before generation`, err);
+            showError(
+              `Image ${i + 1} failed before generation: ${err instanceof Error ? err.message : String(err)}`,
+              "Continuing with remaining images...",
+            );
+          }
+        }
+
+        for (let i = 0; i < workerPages.length; i++) {
+          if (!generationStarted[i]) continue;
+
+          const workerPage = workerPages[i]!;
+          const workerLabel = `worker-${i + 1}`;
+          const imagePath = imagePaths[i]!;
+
+          if (headed) {
+            await workerPage.bringToFront().catch(() => undefined);
+          }
+
+          showStep(`Waiting for image ${i + 1} and downloading...`);
+
+          try {
+            const savedPath = await withSpinner(SPINNER_LABELS.downloading, () =>
+              finishSingleImageDownload(workerPage, imagePath, workerLabel)
+            );
+            savedPaths.push(savedPath);
+          } catch (err) {
+            debugLog(`${workerLabel} failed while waiting/downloading`, err);
+            showError(
+              `Image ${i + 1} failed: ${err instanceof Error ? err.message : String(err)}`,
+              "Continuing with remaining images...",
+            );
+          }
+        }
+
+        if (!debug) {
+          await Promise.all(
+            workerPages.slice(1).map(async (workerPage) => {
+              try {
+                await workerPage.close();
+              } catch {
+                // Ignore close errors from already-closed pages.
+              }
+            }),
           );
-          if (count === 1) throw err;
         }
       }
 

@@ -42,7 +42,13 @@ export async function launchBrowser(options: BrowserOptions): Promise<BrowserSes
     channel: channel as "chrome" | undefined,
     userDataDir: profilePath,
     defaultViewport: DEFAULT_VIEWPORT,
-    args: ["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+    args: [
+      "--no-sandbox",
+      "--disable-blink-features=AutomationControlled",
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding",
+    ],
     ignoreDefaultArgs: ["--enable-automation"],
   });
 
@@ -63,11 +69,20 @@ export async function launchBrowser(options: BrowserOptions): Promise<BrowserSes
 }
 
 /**
+ * Create a new page in the browser with default viewport/user-agent.
+ */
+export async function createPage(session: BrowserSession): Promise<Page> {
+  const page = await session.browser.newPage();
+  await applyPageDefaults(page);
+  return page;
+}
+
+/**
  * Get or create a page in the browser.
  */
 export async function getOrCreatePage(session: BrowserSession): Promise<Page> {
   const pages = await session.browser.pages();
-  const page = pages.length > 0 ? pages[0]! : await session.browser.newPage();
+  const page = pages.length > 0 ? pages[0]! : await createPage(session);
   await applyPageDefaults(page);
   return page;
 }

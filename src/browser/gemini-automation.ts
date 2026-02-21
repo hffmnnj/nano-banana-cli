@@ -1,4 +1,4 @@
-import { readdir, rename, stat } from "fs/promises";
+import { readdir, rename, rm, stat } from "fs/promises";
 import { dirname, join } from "path";
 import type { ElementHandle, Page } from "puppeteer";
 import { isAuthRequired } from "./auth-detector";
@@ -15,12 +15,18 @@ function sleep(ms: number): Promise<void> {
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
   return Promise.race([
     promise,
     new Promise<T>((_, reject) => {
-      setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+      timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
     }),
-  ]);
+  ]).finally(() => {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  });
 }
 
 async function isVisible(handle: ElementHandle<Element>): Promise<boolean> {
@@ -98,6 +104,18 @@ export async function initiateImageCreation(page: Page): Promise<void> {
   const clicked = await clickFirstVisible(page, selectors, 10_000);
   if (!clicked) throw new SelectorError("Gemini image creation entry point");
   await sleep(1_000);
+}
+
+export async function startNewChat(page: Page): Promise<void> {
+  const newChat = await queryVisible(page, '[aria-label="New chat"]', 5_000);
+  if (!newChat) return;
+
+  try {
+    await newChat.click();
+    await sleep(600);
+  } catch {
+    // Ignore and continue if already on a fresh chat.
+  }
 }
 
 export async function typePrompt(page: Page, prompt: string): Promise<void> {
@@ -186,38 +204,79 @@ export async function waitForGeneration(page: Page): Promise<void> {
   }
 }
 
-async function findGeneratedImage(page: Page): Promise<ElementHandle<Element> | null> {
-  const selectors = ['img[alt*="AI generated" i]', 'img[alt*="generated" i]'];
+async function findLatestGeneratedImage(page: Page): Promise<ElementHandle<Element> | null> {
+  const preferred = await page.$$('img[alt*="AI generated" i]');
+  const candidates = preferred.length > 0 ? preferred : await page.$$('img[alt*="generated" i]');
 
-  for (const selector of selectors) {
-    const image = await queryVisible(page, selector);
-    if (image) return image;
+  let best: { handle: ElementHandle<Element>; y: number; x: number } | null = null;
+
+  for (const image of candidates) {
+    const box = await image.boundingBox();
+    if (!box || box.width <= 0 || box.height <= 0) continue;
+
+    if (!best || box.y > best.y || (box.y === best.y && box.x > best.x)) {
+      best = { handle: image, y: box.y, x: box.x };
+    }
   }
 
-  return null;
+  return best?.handle ?? null;
 }
 
-async function hoverGeneratedImage(page: Page): Promise<void> {
-  const image = await findGeneratedImage(page);
-  if (!image) return;
+async function hoverGeneratedImage(page: Page): Promise<ElementHandle<Element> | null> {
+  const image = await findLatestGeneratedImage(page);
+  if (!image) return null;
 
   const box = await image.boundingBox();
-  if (!box) return;
+  if (!box) return null;
 
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
   await sleep(400);
+  return image;
 }
 
 export async function hoverToRevealDownload(page: Page): Promise<void> {
   await hoverGeneratedImage(page);
 }
 
-async function clickDownloadFullSize(page: Page): Promise<void> {
+async function clickDownloadFullSize(
+  page: Page,
+  targetImage: ElementHandle<Element>,
+): Promise<void> {
   const selectors = [
     '[data-test-id="download-generated-image-button"]',
     '[aria-label="Download full-sized image"]',
     '[aria-label*="Download full-sized" i]',
   ];
+
+  const clickedNearImage = await targetImage.evaluate((imageNode, selectorList) => {
+    const isVisible = (el: HTMLElement): boolean => {
+      const styles = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return styles.display !== "none"
+        && styles.visibility !== "hidden"
+        && Number.parseFloat(styles.opacity || "1") > 0
+        && rect.width > 0
+        && rect.height > 0;
+    };
+
+    let root: HTMLElement | null = imageNode.parentElement;
+    while (root) {
+      for (const selector of selectorList) {
+        const btn = root.querySelector(selector);
+        if (btn instanceof HTMLElement && isVisible(btn)) {
+          btn.click();
+          return true;
+        }
+      }
+      root = root.parentElement;
+    }
+
+    return false;
+  }, selectors);
+
+  if (clickedNearImage) {
+    return;
+  }
 
   // Try visible-click first after hover.
   for (const selector of selectors) {
@@ -279,31 +338,44 @@ async function waitForDownloadedFile(
 }
 
 export async function downloadImage(page: Page, outputPath: string): Promise<string> {
-  await hoverGeneratedImage(page);
+  const image = await hoverGeneratedImage(page);
+  if (!image) {
+    throw new SelectorError("Generated image element");
+  }
 
   const outputDir = dirname(outputPath);
   await ensureDir(outputDir);
 
-  const beforeFiles = new Set(await readdir(outputDir).catch(() => [] as string[]));
+  const tempDownloadDir = join(
+    outputDir,
+    `.nban-download-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+  );
+  await ensureDir(tempDownloadDir);
+
+  const beforeFiles = new Set(await readdir(tempDownloadDir).catch(() => [] as string[]));
 
   // Route browser download into the target directory.
   const cdp = await page.target().createCDPSession();
   try {
     await cdp.send("Page.setDownloadBehavior", {
       behavior: "allow",
-      downloadPath: outputDir,
+      downloadPath: tempDownloadDir,
     });
   } catch {
     // Continue; some environments may not support this command.
   }
 
-  await clickDownloadFullSize(page);
+  await clickDownloadFullSize(page, image);
 
-  const downloadedName = await waitForDownloadedFile(outputDir, beforeFiles, 30_000);
-  const downloadedPath = join(outputDir, downloadedName);
+  const downloadedName = await waitForDownloadedFile(tempDownloadDir, beforeFiles, 30_000);
+  const downloadedPath = join(tempDownloadDir, downloadedName);
 
-  if (downloadedPath !== outputPath) {
-    await rename(downloadedPath, outputPath);
+  try {
+    if (downloadedPath !== outputPath) {
+      await rename(downloadedPath, outputPath);
+    }
+  } finally {
+    await rm(tempDownloadDir, { recursive: true, force: true });
   }
 
   return outputPath;
