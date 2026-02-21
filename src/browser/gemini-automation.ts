@@ -1,7 +1,7 @@
-import { mkdir } from "fs/promises";
 import { dirname } from "path";
 import type { Locator, Page } from "playwright";
 import { isAuthRequired } from "./auth-detector";
+import { ensureDir } from "../utils/paths";
 import { GenerationTimeoutError, SelectorError } from "../utils/errors";
 
 const GEMINI_URL = "https://gemini.google.com/app";
@@ -436,7 +436,7 @@ export async function downloadImage(page: Page, outputPath: string): Promise<str
   }
 
   const download = await downloadPromise;
-  await mkdir(dirname(outputPath), { recursive: true });
+  await ensureDir(dirname(outputPath));
   await download.saveAs(outputPath);
 
   return outputPath;
