@@ -148,7 +148,7 @@ When `--debug` is active, the browser stays open on failure so you can see exact
 - Image generation can take 30–60+ seconds depending on Gemini's load.
 - A 6-minute generation watchdog is in place — if Gemini takes longer than that, the request is abandoned and an error is returned.
 - If your session expires, just run `nanban auth` again.
-- Gemini's image generation requires the **Pro** model. `nanban` switches to it automatically if Gemini defaults to Fast.
+- `nanban` automatically switches you to the **Pro** model, this will be updated once Google releases a good fast model.
 
 ---
 
