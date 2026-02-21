@@ -17,6 +17,7 @@ import {
 } from "../browser/auth-recovery";
 import {
   downloadImage,
+  ensureProModel,
   hoverToRevealDownload,
   initiateImageCreation,
   navigateToGemini,
@@ -211,6 +212,7 @@ export default defineCommand({
         await navigateToGemini(workerPage);
         await startNewChat(workerPage);
         await initiateImageCreation(workerPage);
+        await ensureProModel(workerPage);
         await typePrompt(workerPage, prompt);
         await triggerGeneration(workerPage);
         debugLog(`[${workerLabel}] generation triggered`);
@@ -239,6 +241,7 @@ export default defineCommand({
         await withSpinner(SPINNER_LABELS.initiating, async () => {
           await startNewChat(page);
           await initiateImageCreation(page);
+          await ensureProModel(page);
         });
         await withSpinner(SPINNER_LABELS.typing, () => typePrompt(page, prompt));
         await withSpinner(SPINNER_LABELS.generating, async () => {

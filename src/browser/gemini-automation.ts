@@ -10,6 +10,8 @@ const NAV_TIMEOUT = 30_000;
 const SHORT_WAIT_TIMEOUT = 2_000;
 const GENERATION_TIMEOUT = 300_000;
 
+type ModelLabel = "fast" | "thinking" | "pro";
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -116,6 +118,152 @@ export async function startNewChat(page: Page): Promise<void> {
   } catch {
     // Ignore and continue if already on a fresh chat.
   }
+}
+
+async function getCurrentModelChip(page: Page): Promise<ModelLabel | null> {
+  return page.evaluate(() => {
+    const modelMap: Record<string, "fast" | "thinking" | "pro"> = {
+      fast: "fast",
+      thinking: "thinking",
+      pro: "pro",
+    };
+
+    const isVisible = (el: HTMLElement): boolean => {
+      const styles = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return styles.display !== "none"
+        && styles.visibility !== "hidden"
+        && Number.parseFloat(styles.opacity || "1") > 0
+        && rect.width > 0
+        && rect.height > 0;
+    };
+
+    const norm = (text: string): string => text.trim().replace(/\s+/g, " ").toLowerCase();
+
+    const candidates = Array.from(document.querySelectorAll("button, [role='button']"))
+      .filter((el): el is HTMLElement => el instanceof HTMLElement)
+      .filter((el) => !el.hasAttribute("disabled") && el.getAttribute("aria-disabled") !== "true")
+      .filter((el) => isVisible(el))
+      .map((el) => {
+        const text = norm((el.innerText || "").split("\n")[0] || "");
+        const rect = el.getBoundingClientRect();
+        return { el, text, rect };
+      })
+      .filter(({ text, rect }) => text in modelMap && rect.width <= 220 && rect.height <= 80)
+      // Prefer the model chip in the lower composer area, not top navigation badges.
+      .sort((a, b) => b.rect.y - a.rect.y);
+
+    if (candidates.length === 0) return null;
+    const selected = candidates[0]!.text;
+    return modelMap[selected] ?? null;
+  });
+}
+
+async function clickModelChip(page: Page, label: ModelLabel): Promise<boolean> {
+  return page.evaluate((target) => {
+    const isVisible = (el: HTMLElement): boolean => {
+      const styles = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return styles.display !== "none"
+        && styles.visibility !== "hidden"
+        && Number.parseFloat(styles.opacity || "1") > 0
+        && rect.width > 0
+        && rect.height > 0;
+    };
+
+    const norm = (text: string): string => text.trim().replace(/\s+/g, " ").toLowerCase();
+
+    const candidates = Array.from(document.querySelectorAll("button, [role='button']"))
+      .filter((el): el is HTMLElement => el instanceof HTMLElement)
+      .filter((el) => !el.hasAttribute("disabled") && el.getAttribute("aria-disabled") !== "true")
+      .filter((el) => isVisible(el))
+      .map((el) => ({
+        el,
+        text: norm((el.innerText || "").split("\n")[0] || ""),
+        rect: el.getBoundingClientRect(),
+      }))
+      .filter(({ text, rect }) => text === target && rect.width <= 220 && rect.height <= 80)
+      .sort((a, b) => b.rect.y - a.rect.y);
+
+    if (candidates.length === 0) return false;
+    candidates[0]!.el.click();
+    return true;
+  }, label);
+}
+
+async function clickModelOptionInOpenMenu(page: Page, label: ModelLabel): Promise<boolean> {
+  return page.evaluate((target) => {
+    const isVisible = (el: HTMLElement): boolean => {
+      const styles = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return styles.display !== "none"
+        && styles.visibility !== "hidden"
+        && Number.parseFloat(styles.opacity || "1") > 0
+        && rect.width > 0
+        && rect.height > 0;
+    };
+
+    const norm = (text: string): string => text.trim().replace(/\s+/g, " ").toLowerCase();
+
+    const containers = Array.from(document.querySelectorAll("div, section, [role='menu'], [role='listbox'], [role='dialog'], ul"))
+      .filter((el): el is HTMLElement => el instanceof HTMLElement)
+      .filter((el) => isVisible(el))
+      .filter((el) => {
+        const text = norm(el.innerText || "");
+        return text.includes("fast") && text.includes("thinking") && text.includes("pro");
+      })
+      .sort((a, b) => {
+        const areaA = a.getBoundingClientRect().width * a.getBoundingClientRect().height;
+        const areaB = b.getBoundingClientRect().width * b.getBoundingClientRect().height;
+        return areaA - areaB;
+      });
+
+    const findOptionIn = (root: ParentNode): HTMLElement | null => {
+      const nodes = Array.from(root.querySelectorAll("button, [role='menuitem'], [role='option'], [role='button'], li, div"))
+        .filter((el): el is HTMLElement => el instanceof HTMLElement)
+        .filter((el) => isVisible(el));
+
+      for (const node of nodes) {
+        const firstLine = norm((node.innerText || "").split("\n")[0] || "");
+        if (firstLine !== target) continue;
+        if (node.getAttribute("aria-disabled") === "true" || node.hasAttribute("disabled")) continue;
+        return node;
+      }
+
+      return null;
+    };
+
+    for (const container of containers) {
+      const option = findOptionIn(container);
+      if (option) {
+        option.click();
+        return true;
+      }
+    }
+
+    return false;
+  }, label);
+}
+
+export async function ensureProModel(page: Page): Promise<void> {
+  const current = await getCurrentModelChip(page);
+
+  // Only force-switch when Gemini defaults to Fast.
+  if (current !== "fast") return;
+
+  const opened = await clickModelChip(page, "fast");
+  if (!opened) {
+    throw new SelectorError("Fast model chip");
+  }
+
+  await sleep(300);
+
+  const switched = await clickModelOptionInOpenMenu(page, "pro");
+  if (!switched) {
+    throw new SelectorError("Pro model option");
+  }
+
+  await sleep(400);
 }
 
 export async function typePrompt(page: Page, prompt: string): Promise<void> {
