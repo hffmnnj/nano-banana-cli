@@ -11,6 +11,7 @@ export async function detectChannel(): Promise<"chrome" | undefined> {
     await browser.close();
     return "chrome";
   } catch {
+    // System Chrome not available — fall back to bundled Chromium.
     return undefined;
   }
 }

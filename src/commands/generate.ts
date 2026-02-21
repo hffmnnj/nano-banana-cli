@@ -160,10 +160,11 @@ export default defineCommand({
         showOutro(`${savedPaths.length} images saved`);
       }
     } catch (err) {
-      showError(
-        err instanceof Error ? err.message : "An unexpected error occurred.",
-        "Run `nanban auth` if you need to sign in first.",
-      );
+      const message = err instanceof Error ? err.message : "An unexpected error occurred.";
+      const hint = err instanceof NanoBananaError
+        ? err.hint
+        : "Run `nanban auth` if you need to sign in first.";
+      showError(message, hint);
       process.exit(1);
     } finally {
       if (session) {
