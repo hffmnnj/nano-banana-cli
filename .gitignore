@@ -1,6 +1,35 @@
+# Dependencies
 node_modules/
+
+# Build output
 dist/
-bun.lockb
-.goopspec/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# npm credentials — never commit auth tokens
+.npmrc
+
+# Logs
+*.log
+npm-debug.log*
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# Generated images (tool output)
 *.png
+
+# OS metadata
 .DS_Store
+Thumbs.db
+ehthumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# Tools
+.goopspec/
